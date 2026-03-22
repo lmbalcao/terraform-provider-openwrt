@@ -1,9 +1,11 @@
 package lucirpc_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -255,6 +257,56 @@ func TestClientCreateSection(t *testing.T) {
 		)
 
 		// Then
+		assert.Check(t, committed)
+	})
+
+	t.Run("supports ubus fallback", func(t *testing.T) {
+		// Given
+		ctx := context.Background()
+		var added bool
+		var committed bool
+		handle := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cgi-bin/luci/admin/ubus":
+				object, method, arguments := decodeUBusRequest(t, r)
+				switch {
+				case object == "uci" && method == "add":
+					added = true
+					assert.Equal(t, string(arguments["config"]), `"network"`)
+					assert.Equal(t, string(arguments["type"]), `"interface"`)
+					assert.Equal(t, string(arguments["name"]), `"testing"`)
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0,{"section":"testing"}]}`)
+				case object == "uci" && method == "commit":
+					committed = true
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0]}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}
+		client, close := authenticatedUBusClient(
+			t,
+			ctx,
+			http.HandlerFunc(handle),
+		)
+		defer close()
+
+		// When
+		got, err := client.CreateSection(
+			ctx,
+			"network",
+			"interface",
+			"testing",
+			lucirpc.Options{},
+		)
+
+		// Then
+		assert.NilError(t, err)
+		assert.Check(t, got)
+		assert.Check(t, added)
 		assert.Check(t, committed)
 	})
 }
@@ -732,6 +784,48 @@ func TestClientGetSection(t *testing.T) {
 		}
 		assert.DeepEqual(t, got, want)
 	})
+
+	t.Run("supports ubus fallback", func(t *testing.T) {
+		// Given
+		ctx := context.Background()
+		handle := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cgi-bin/luci/admin/ubus":
+				object, method, _ := decodeUBusRequest(t, r)
+				switch {
+				case object == "uci" && method == "get":
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0,{"values":{".name":"section-name","baz":"1","foo":"bar"}}]}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}
+		client, close := authenticatedUBusClient(
+			t,
+			ctx,
+			http.HandlerFunc(handle),
+		)
+		defer close()
+
+		// When
+		got, err := client.GetSection(
+			ctx,
+			"network",
+			"testing",
+		)
+
+		// Then
+		assert.NilError(t, err)
+		want := lucirpc.Options{
+			".name": lucirpc.String("section-name"),
+			"baz":   lucirpc.Boolean(true),
+			"foo":   lucirpc.String("bar"),
+		}
+		assert.DeepEqual(t, got, want)
+	})
 }
 
 func TestNewClient(t *testing.T) {
@@ -885,6 +979,42 @@ func TestNewClient(t *testing.T) {
 			fmt.Fprintf(w, `{
 				"result": "abc123"
 			}`)
+		}
+		address, port, close := newServer(t, http.HandlerFunc(handle))
+		defer close()
+
+		// When
+		_, err := lucirpc.NewClient(
+			ctx,
+			address.Scheme,
+			address.Hostname(),
+			uint16(port),
+			"root",
+			"",
+		)
+
+		// Then
+		assert.NilError(t, err)
+	})
+
+	t.Run("falls back to ubus when legacy auth endpoint is unavailable", func(t *testing.T) {
+		// Given
+		ctx := context.Background()
+		handle := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cgi-bin/luci/rpc/auth":
+				w.WriteHeader(http.StatusNotFound)
+			case "/cgi-bin/luci/admin/ubus":
+				object, method, _ := decodeUBusRequest(t, r)
+				switch {
+				case object == "session" && method == "login":
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0,{"ubus_rpc_session":"abc123"}]}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
 		}
 		address, port, close := newServer(t, http.HandlerFunc(handle))
 		defer close()
@@ -1139,6 +1269,54 @@ func TestClientUpdateSection(t *testing.T) {
 		// Then
 		assert.Check(t, committed)
 	})
+
+	t.Run("supports ubus fallback", func(t *testing.T) {
+		// Given
+		ctx := context.Background()
+		var updated bool
+		var committed bool
+		handle := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cgi-bin/luci/admin/ubus":
+				object, method, arguments := decodeUBusRequest(t, r)
+				switch {
+				case object == "uci" && method == "set":
+					updated = true
+					assert.Equal(t, string(arguments["config"]), `"network"`)
+					assert.Equal(t, string(arguments["section"]), `"testing"`)
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0]}`)
+				case object == "uci" && method == "commit":
+					committed = true
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0]}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}
+		client, close := authenticatedUBusClient(
+			t,
+			ctx,
+			http.HandlerFunc(handle),
+		)
+		defer close()
+
+		// When
+		got, err := client.UpdateSection(
+			ctx,
+			"network",
+			"testing",
+			lucirpc.Options{"foo": lucirpc.String("bar")},
+		)
+
+		// Then
+		assert.NilError(t, err)
+		assert.Check(t, got)
+		assert.Check(t, updated)
+		assert.Check(t, committed)
+	})
 }
 
 func authenticatedClient(
@@ -1175,6 +1353,91 @@ func authenticatedClient(
 	}
 
 	return client, close
+}
+
+func authenticatedUBusClient(
+	t *testing.T,
+	ctx context.Context,
+	handler http.Handler,
+) (*lucirpc.Client, func()) {
+	t.Helper()
+	handleWithAuth := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/luci/rpc/auth":
+			w.WriteHeader(http.StatusNotFound)
+		case "/cgi-bin/luci/admin/ubus":
+			body, err := io.ReadAll(r.Body)
+			assert.NilError(t, err)
+			r.Body.Close()
+			object, method, _ := decodeUBusPayload(t, body)
+			switch {
+			case object == "session" && method == "login":
+				fmt.Fprintf(w, `{"jsonrpc":"2.0","result":[0,{"ubus_rpc_session":"abc123"}]}`)
+			default:
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				handler.ServeHTTP(w, r)
+			}
+		default:
+			handler.ServeHTTP(w, r)
+		}
+	}
+	address, port, close := newServer(
+		t,
+		http.HandlerFunc(handleWithAuth),
+	)
+	client, err := lucirpc.NewClient(
+		ctx,
+		address.Scheme,
+		address.Hostname(),
+		uint16(port),
+		"root",
+		"",
+	)
+	if err != nil {
+		close()
+		assert.NilError(t, err)
+	}
+
+	return client, close
+}
+
+type ubusTestRequestBody struct {
+	Params []json.RawMessage `json:"params"`
+}
+
+func decodeUBusRequest(
+	t *testing.T,
+	r *http.Request,
+) (string, string, map[string]json.RawMessage) {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	assert.NilError(t, err)
+	return decodeUBusPayload(t, body)
+}
+
+func decodeUBusPayload(
+	t *testing.T,
+	body []byte,
+) (string, string, map[string]json.RawMessage) {
+	t.Helper()
+	var request ubusTestRequestBody
+	err := json.Unmarshal(body, &request)
+	assert.NilError(t, err)
+	assert.Assert(t, len(request.Params) == 4)
+
+	var object string
+	err = json.Unmarshal(request.Params[1], &object)
+	assert.NilError(t, err)
+
+	var method string
+	err = json.Unmarshal(request.Params[2], &method)
+	assert.NilError(t, err)
+
+	arguments := map[string]json.RawMessage{}
+	err = json.Unmarshal(request.Params[3], &arguments)
+	assert.NilError(t, err)
+
+	return object, method, arguments
 }
 
 func newServer(
